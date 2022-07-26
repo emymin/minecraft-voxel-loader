@@ -20,7 +20,23 @@ from math import floor
 
 BLOCK_SIZE = 1 # How many blender units equivelate to 1 Minecraft block (higher values reduce size of structure in the game)
 
-def create_blocks(obj, origin=Vector((0,0,0))):
+def create_texture_cache(objects, cache):
+    print("[Voxelizer] Creating texture cache")
+    cache = {}
+    for obj in objects:
+        for material_slot in obj.material_slots:
+            material = material_slot.material
+            if not material.name in cache:
+                for x in material.node_tree.nodes:
+                    if x.type=='TEX_IMAGE':
+                        image_texture = x.image
+                        print("[Voxelizer] Using image "+image_texture.name+ " for material "+material.name)
+                        cache[material.name] = image_texture
+                        break
+    print("[Voxelizer] Texture cache done")
+
+
+def create_blocks(obj, origin=Vector((0,0,0)), use_nodes=False,block_scale=1.0,material_textures={}):
     bm = bmesh.new()
     bm.from_object(obj, depsgraph)
     bm.verts.ensure_lookup_table()
@@ -30,20 +46,29 @@ def create_blocks(obj, origin=Vector((0,0,0))):
     
     # Extract vertex colors if present
     vertex_colors = [(1.0,1.0,1.0)] * len(bm.verts)
-    if image_texture is not None:
+    if use_nodes:
         uv_layer = bm.loops.layers.uv.active
         
         for face in bm.faces:
+            found_texture = False
+            material = obj.material_slots[face.material_index].material
+            if material.name in material_textures:
+                image_texture = material_textures[material.name]
+                found_texture= True
+            
             for loop in face.loops:
-                uv = loop[uv_layer].uv
-                
-                pixel_x = int((uv.x % 1) * image_texture.size[0])
-                pixel_y = int((uv.y % 1) * image_texture.size[1])
-                
-                pixel_index = (pixel_y * image_texture.size[0] + pixel_x) * image_texture.channels
-                
-                vertex_colors[loop.vert.index] = Vector(image_texture.pixels[pixel_index:pixel_index+3])
-        
+                if found_texture:
+                    uv = loop[uv_layer].uv
+                    
+                    pixel_x = int((uv.x % 1) * image_texture.size[0])
+                    pixel_y = int((uv.y % 1) * image_texture.size[1])
+                    
+                    pixel_index = (pixel_y * image_texture.size[0] + pixel_x) * image_texture.channels
+                    
+                    vertex_colors[loop.vert.index] = Vector(image_texture.pixels[pixel_index:pixel_index+3])
+                else:
+                    vertex_colors[loop.vert.index] = [1,1,1]
+            
     elif 'Col' in bm.loops.layers.color:
         color_layer = bm.loops.layers.color['Col']
         for face in bm.faces:
@@ -52,7 +77,7 @@ def create_blocks(obj, origin=Vector((0,0,0))):
     
     for vertex in bm.verts:
         vertex_pos = obj.matrix_world @ vertex.co
-        block_pos = (vertex_pos - origin) / BLOCK_SIZE
+        block_pos = (vertex_pos - origin) / block_scale
         block_x = floor(block_pos.x)
         block_y = floor(block_pos.y)
         block_z = floor(block_pos.z)
@@ -81,11 +106,13 @@ class VOXELIZER_PT_panel(bpy.types.Panel):
     def draw(self, context):
         col1 = self.layout.column(align = True)
         col1.prop(context.scene, "vx_output_dir_prop")
-        col1.prop(context.scene, "vx_texture_path_prop")
+        col1.prop(context.scene, "vx_use_nodes")
+        col1.prop(context.scene,"vx_selected_only")
         
         col2 = self.layout.column(align = True)
         col2.prop(context.scene, "vx_start_frame_prop")
         col2.prop(context.scene, "vx_end_frame_prop")
+        col2.prop(context.scene,"vx_block_scale")
         self.layout.operator("object.voxelize", icon='MESH_CUBE', text="Voxelize")
 
 class Voxelizer_OT_operator(bpy.types.Operator):
@@ -105,14 +132,6 @@ class Voxelizer_OT_operator(bpy.types.Operator):
             self.report({"ERROR"}, "Output dir does not exist.")
             return {"CANCELLED"}
         
-        if len(bpy.context.scene.vx_texture_path_prop.strip()) > 0:
-            try:
-                image_texture = bpy.data.images.load(bpy.context.scene.vx_texture_path_prop)
-            except:
-                self.report({"ERROR"}, "Could not open image file.")
-                return {"CANCELLED"}
-        else:
-            image_texture = None
         
         depsgraph = context.evaluated_depsgraph_get()
         
@@ -125,16 +144,27 @@ class Voxelizer_OT_operator(bpy.types.Operator):
         except:
             print("[Voxelizer] Failed to save file")
 
-        if image_texture is not None:
+        if bpy.context.scene.vx_use_nodes is not None:
             print("Using image texture for colors")
         else:
             print("Using vertex colors")
 
+        objects = []
+        if bpy.context.scene.vx_selected_only:
+            objects = context.selected_objects
+        else:
+            objects = meshes = set(o for o in bpy.context.scene.objects if o.type == 'MESH')
+
+
+        cache={}
+        if bpy.context.scene.vx_use_nodes:
+            create_texture_cache(objects,cache)
+
         for frame in range(bpy.context.scene.vx_start_frame_prop, bpy.context.scene.vx_end_frame_prop+1):
             bpy.context.scene.frame_set(frame)
             blocks = {}
-            for obj in context.selected_objects:
-                blocks.update(create_blocks(obj))
+            for obj in objects:
+                blocks.update(create_blocks(obj,use_nodes=bpy.context.scene.vx_use_nodes,block_scale=bpy.context.scene.vx_block_scale,material_textures=cache))
             save_blocks(blocks, os.path.join(output_dir,f'{frame}.blocks'))
             print("[Voxelizer] Saved frame "+str(frame))
             
@@ -145,9 +175,11 @@ class Voxelizer_OT_operator(bpy.types.Operator):
 
 def register():
     bpy.types.Scene.vx_output_dir_prop = bpy.props.StringProperty(name = "Output directory", description = "Where the voxel data for every frame should be saved to", default = "", subtype = "DIR_PATH")
-    bpy.types.Scene.vx_texture_path_prop = bpy.props.StringProperty(name = "Image texture", description = "An image texture to use. Leave empty to use vertex colors instead.", default = "", subtype = "FILE_PATH")
+    bpy.types.Scene.vx_use_nodes = bpy.props.BoolProperty(name = "Use Images from Nodes", description = "Wheter or not the script should read the textures from material nodes. Disable to use vertex colors instead", default = False)
+    bpy.types.Scene.vx_selected_only = bpy.props.BoolProperty(name = "Selected Only", description = "Only voxelize selected meshes", default = False)
     bpy.types.Scene.vx_start_frame_prop = bpy.props.IntProperty(name = "Start frame", default = 0)
     bpy.types.Scene.vx_end_frame_prop = bpy.props.IntProperty(name = "End frame", default = 250)
+    bpy.types.Scene.vx_block_scale = bpy.props.FloatProperty(name="Block scale",description="Ratio of blender units to minecraft blocks",default=1.0)
     
     bpy.utils.register_class(Voxelizer_OT_operator)
     bpy.utils.register_class(VOXELIZER_PT_panel)
@@ -157,7 +189,7 @@ def unregister():
     bpy.utils.unregister_class(Voxelizer_OT_operator)
     
     del bpy.types.Scene.vx_output_dir_prop
-    del bpy.types.Scene.vx_texture_path_prop
+    del bpy.types.Scene.vx_use_nodes
     del bpy.types.Scene.vx_start_frame_prop
     del bpy.types.Scene.vx_end_frame_prop
 
